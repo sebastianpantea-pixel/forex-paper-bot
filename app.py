@@ -1,15 +1,20 @@
 """
 Forex Intraday Bot — Flask Server
 Paper Trading cu date reale de la Twelve Data
+Optimizat pentru plan cu limita mica de requesturi
 
-Perechi: EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, XAU/USD
-Strategie: Triple EMA Trend Filter + ATR Stop + Session Filter
+Strategie:
 - Trend pe H1: EMA50 vs EMA200
 - Entry pe M15: pullback la EMA21
 - ATR-based SL/TP
 - Session filter: London + NY only
-- Max 1 pozitie per pereche
-- Max 4 pozitii totale
+
+Optimizari pentru API:
+- doar 2 perechi implicite
+- scanare la 15 minute
+- fara retry agresiv
+- fara request separat de pret pentru fiecare pozitie
+- foloseste ultimul close din M15 pentru mark price si semnal
 """
 
 import os
@@ -30,10 +35,10 @@ CORS(app)
 # ─── Config ───────────────────────────────────────────────────────────────────
 PAIRS_MAP = {
     "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
     "USDCHF": "USD/CHF",
+    "GBPUSD": "GBP/USD",
     "AUDUSD": "AUD/USD",
+    "USDJPY": "USD/JPY",
     "XAUUSD": "XAU/USD",
 }
 
@@ -59,10 +64,12 @@ state = {
     "last_trade_ts": {},
     "current_day": datetime.utcnow().strftime("%Y-%m-%d"),
     "session": "closed",
+    "last_prices": {},
+    "last_scan_data": {},
 }
 
 settings = {
-    "pairs": ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "XAUUSD"],
+    "pairs": ["EURUSD", "USDCHF"],
     "capital": 10000.0,
     "risk_pct": 0.5,
     "dd_limit": 3.0,
@@ -72,9 +79,9 @@ settings = {
     "trend_ema_fast": 50,
     "trend_ema_slow": 200,
     "entry_ema": 21,
-    "scan_interval": 300,
+    "scan_interval": 900,
     "max_trades_day": 4,
-    "max_positions": 4,
+    "max_positions": 2,
     "cooldown_minutes": 60,
     "pause_after_losses": 3,
     "session_filter": True,
@@ -180,7 +187,6 @@ def is_tradeable_session():
 
 def normalize_interval(interval):
     return {
-        "1m": "1min",
         "15m": "15min",
         "1h": "1h",
         "1d": "1day",
@@ -235,50 +241,25 @@ def fetch_td_series(symbol, interval, outputsize):
     return clean_ohlcv(df)
 
 # ─── Date de piata ─────────────────────────────────────────────────────────────
-def get_price(pair):
-    symbol = PAIRS_MAP.get(pair)
-    if not symbol:
-        return None
-
-    try:
-        # luam ultima lumânare 1min ca pret curent aproximativ
-        df = fetch_td_series(symbol, "1min", 2)
-        if df.empty:
-            add_log(f"[{pair}] Price data goala ({symbol}).", "warn")
-            return None
-        return float(df["close"].iloc[-1])
-    except Exception as e:
-        add_log(f"[{pair}] Price error ({symbol}): {e}", "err")
-        return None
-
-
 def get_klines(pair, interval="1h", limit=250):
     symbol = PAIRS_MAP.get(pair)
     if not symbol:
         return pd.DataFrame()
 
     td_interval = normalize_interval(interval)
-    last_err = None
 
-    for attempt in range(3):
-        try:
-            df = fetch_td_series(symbol, td_interval, limit)
-            if not df.empty and len(df) >= 30:
-                add_log(f"[{pair}] {interval} ok | rows={len(df)} | try={attempt + 1}", "info")
-                return df.tail(limit)
+    try:
+        df = fetch_td_series(symbol, td_interval, limit)
+        if not df.empty and len(df) >= 30:
+            add_log(f"[{pair}] {interval} ok | rows={len(df)}", "info")
+            return df.tail(limit)
 
-            add_log(f"[{pair}] DataFrame gol {interval} ({symbol}) | try={attempt + 1}", "warn")
-            time.sleep(1.5 * (attempt + 1))
+        add_log(f"[{pair}] DataFrame gol {interval} ({symbol})", "warn")
+        return pd.DataFrame()
 
-        except Exception as e:
-            last_err = e
-            add_log(f"[{pair}] Klines error {interval} ({symbol}) | try={attempt + 1}: {e}", "warn")
-            time.sleep(1.5 * (attempt + 1))
-
-    if last_err:
-        add_log(f"[{pair}] Klines failed {interval} ({symbol}): {last_err}", "err")
-
-    return pd.DataFrame()
+    except Exception as e:
+        add_log(f"[{pair}] Klines error {interval} ({symbol}): {e}", "err")
+        return pd.DataFrame()
 
 # ─── Indicatori ───────────────────────────────────────────────────────────────
 def ema(series, period):
@@ -395,12 +376,21 @@ def scan_pair(pair):
         add_log(f"[{pair}] Date insuficiente.", "warn")
         return None
 
+    latest_m15_close = float(df_m15["close"].iloc[-1])
+
+    with state_lock:
+        state["last_prices"][pair] = latest_m15_close
+        state["last_scan_data"][pair] = {
+            "last_close": latest_m15_close,
+            "last_scan_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
     regime = detect_regime(df_h1)
     with state_lock:
         state["regime"][pair] = regime
 
     trend = detect_trend(df_h1)
-    add_log(f"[{pair}] Trend:{trend or '-'} | Regim:{regime}")
+    add_log(f"[{pair}] Trend:{trend or '-'} | Regim:{regime} | Close:{latest_m15_close:.5f}")
 
     if trend is None:
         return None
@@ -411,6 +401,8 @@ def scan_pair(pair):
         return None
 
     signal = find_entry(df_m15, trend, atr_val)
+    if signal:
+        signal["market_price"] = latest_m15_close
     return signal
 
 # ─── Risk ─────────────────────────────────────────────────────────────────────
@@ -455,10 +447,13 @@ def can_trade(pair):
     return True
 
 # ─── Executie (paper) ─────────────────────────────────────────────────────────
+def get_cached_price(pair):
+    with state_lock:
+        return state["last_prices"].get(pair)
+
+
 def open_trade(pair, signal):
-    price = get_price(pair)
-    if not price:
-        price = signal["entry"]
+    price = signal.get("market_price") or signal["entry"]
 
     sl = float(signal["sl"])
     tp = float(signal["tp"])
@@ -507,7 +502,7 @@ def update_positions():
         open_positions = [p for p in state["positions"] if p["status"] == "open"]
 
     for pos in open_positions:
-        price = get_price(pos["pair"])
+        price = get_cached_price(pos["pair"])
         if not price:
             continue
 
@@ -607,8 +602,6 @@ def bot_loop():
                 state["scan_count"] += 1
                 state["last_scan"] = datetime.utcnow().strftime("%H:%M:%S")
 
-            update_positions()
-
             if not is_tradeable_session():
                 add_log(f"Sesiune {session} - nu trade-uim.", "info")
             else:
@@ -627,11 +620,16 @@ def bot_loop():
                             open_trade(pair, signal)
                         else:
                             add_log(f"[{pair}] Niciun setup.", "info")
+                    else:
+                        # chiar daca nu putem deschide trade, putem actualiza pretul pentru pozitii deja existente
+                        scan_pair(pair)
+
+                update_positions()
 
         except Exception as e:
             add_log(f"Eroare bot_loop: {e}", "err")
 
-        interval = int(settings.get("scan_interval", 300))
+        interval = int(settings.get("scan_interval", 900))
         for _ in range(interval):
             with state_lock:
                 if not state["running"]:
@@ -717,13 +715,9 @@ def api_test_td():
     out = {}
     tests = [
         ("EUR/USD", "15min", 20),
-        ("AUD/USD", "15min", 20),
         ("USD/CHF", "15min", 20),
-        ("XAU/USD", "15min", 20),
         ("EUR/USD", "1h", 20),
-        ("AUD/USD", "1h", 20),
         ("USD/CHF", "1h", 20),
-        ("XAU/USD", "1h", 20),
     ]
 
     for symbol, interval, outputsize in tests:
@@ -779,7 +773,7 @@ def api_close_position():
     else:
         pos = open_pos[0]
 
-    price = get_price(pos["pair"]) or pos.get("mark_price") or pos["entry"]
+    price = get_cached_price(pos["pair"]) or pos.get("mark_price") or pos["entry"]
     if pos["direction"] == "LONG":
         pnl = (price - pos["entry"]) * pos["units"]
     else:
@@ -796,7 +790,8 @@ def api_settings():
     if "pairs" in data:
         v = data["pairs"]
         if isinstance(v, list):
-            settings["pairs"] = [str(s).strip().upper() for s in v if s]
+            cleaned = [str(s).strip().upper() for s in v if s]
+            settings["pairs"] = [p for p in cleaned if p in PAIRS_MAP]
 
     for k in [
         "risk_pct", "dd_limit", "rr_ratio", "atr_sl_mult", "atr_period",
