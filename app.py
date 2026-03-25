@@ -16,13 +16,11 @@ import os
 import json
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import yfinance as yf
 import pandas as pd
-import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -83,9 +81,11 @@ bot_thread = None
 state_lock = threading.Lock()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "forex_state.json"))
 
-PERSIST_KEYS = ["positions", "history", "pnl", "wins", "losses",
-                "trades_today", "daily_dd", "consecutive_losses",
-                "last_trade_ts", "current_day", "capital"]
+PERSIST_KEYS = [
+    "positions", "history", "pnl", "wins", "losses",
+    "trades_today", "daily_dd", "consecutive_losses",
+    "last_trade_ts", "current_day", "capital"
+]
 
 # ─── Persistenta ──────────────────────────────────────────────────────────────
 def save_state():
@@ -154,12 +154,10 @@ def reset_daily_if_needed():
 
 
 def get_session():
-    """Detecteaza sesiunea forex curenta (UTC)."""
+    """Detecteaza sesiunea forex curenta in UTC."""
     now_utc = datetime.utcnow()
     h = now_utc.hour
-    # London: 08:00-17:00 UTC
-    # New York: 13:00-22:00 UTC
-    # Overlap (cel mai bun): 13:00-17:00 UTC
+
     if 13 <= h < 17:
         return "overlap"
     elif 8 <= h < 17:
@@ -177,55 +175,118 @@ def is_tradeable_session():
     session = get_session()
     return session in ("london", "newyork", "overlap")
 
+# ─── Yahoo helpers ────────────────────────────────────────────────────────────
+def normalize_interval(interval):
+    return {
+        "15m": "15m",
+        "1h": "60m",
+        "1d": "1d",
+        "1m": "1m",
+    }.get(interval, interval)
+
+
+def get_period_for_interval(interval):
+    return {
+        "1m": "1d",
+        "15m": "7d",
+        "1h": "60d",
+        "1d": "365d",
+    }.get(interval, "60d")
+
+
+def clean_ohlcv(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[0]).lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
+
+    for col in ["open", "high", "low", "close"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    df = df[["open", "high", "low", "close", "volume"]].copy()
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df
+
+
 # ─── Date de piata ─────────────────────────────────────────────────────────────
 def get_price(pair):
-    """Pret curent pentru o pereche."""
+    """Pret curent estimat din ultima lumânare 1m."""
     ticker = PAIRS_MAP.get(pair)
     if not ticker:
         return None
+
     try:
-        data = yf.Ticker(ticker).fast_info
-        return float(data.last_price)
+        df = yf.download(
+            ticker,
+            interval="1m",
+            period="1d",
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+            prepost=False,
+        )
+
+        df = clean_ohlcv(df)
+        if df.empty:
+            add_log(f"[{pair}] Price data goala ({ticker}).", "warn")
+            return None
+
+        return float(df["close"].iloc[-1])
+
     except Exception as e:
-        add_log(f"[{pair}] Price error: {e}", "err")
+        add_log(f"[{pair}] Price error ({ticker}): {e}", "err")
         return None
 
 
 def get_klines(pair, interval="1h", limit=250):
     """
     Descarca date OHLCV.
-    interval: '15m', '1h', '1d'
+    interval intern: '15m', '1h', '1d'
     """
     ticker = PAIRS_MAP.get(pair)
     if not ticker:
         return pd.DataFrame()
+
     try:
-        period_map = {"15m": "7d", "1h": "60d", "1d": "365d"}
-        period = period_map.get(interval, "60d")
-        df = yf.download(ticker, interval=interval, period=period,
-                         progress=False, auto_adjust=True)
+        yf_interval = normalize_interval(interval)
+        period = get_period_for_interval(interval)
+
+        df = yf.download(
+            ticker,
+            interval=yf_interval,
+            period=period,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+            prepost=False,
+        )
+
+        if df is None or df.empty:
+            add_log(f"[{pair}] yfinance DataFrame gol {interval} ({ticker}).", "warn")
+            return pd.DataFrame()
+
+        df = clean_ohlcv(df)
         if df.empty:
-            add_log(f"[{pair}] yfinance DataFrame gol {interval}.", "warn")
+            add_log(f"[{pair}] OHLC invalid {interval} ({ticker}).", "err")
             return pd.DataFrame()
 
-        # Flatten MultiIndex columns (yfinance >= 0.2.37)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0].lower() for c in df.columns]
-        else:
-            df.columns = [c.lower() for c in df.columns]
+        add_log(f"[{pair}] {interval} ok | rows={len(df)} | ticker={ticker}", "info")
 
-        needed = ["open", "high", "low", "close", "volume"]
-        df = df[[c for c in needed if c in df.columns]]
-
-        if "close" not in df.columns:
-            add_log(f"[{pair}] Coloana close lipseste.", "err")
+        if len(df) < 30:
+            add_log(f"[{pair}] Prea putine lumanari pe {interval}: {len(df)}", "warn")
             return pd.DataFrame()
 
-        df = df.dropna(subset=["close"])
-        df = df.tail(limit)
-        return df
+        return df.tail(limit)
+
     except Exception as e:
-        add_log(f"[{pair}] Klines error: {e}", "err")
+        add_log(f"[{pair}] Klines error {interval} ({ticker}): {e}", "err")
         return pd.DataFrame()
 
 # ─── Indicatori ───────────────────────────────────────────────────────────────
@@ -267,10 +328,10 @@ def detect_trend(df_h1):
     ema_fast = ema(closes, settings["trend_ema_fast"])
     ema_slow = ema(closes, settings["trend_ema_slow"])
 
-    fast_now  = ema_fast.iloc[-1]
+    fast_now = ema_fast.iloc[-1]
     fast_prev = ema_fast.iloc[-2]
-    slow_now  = ema_slow.iloc[-1]
-    price     = closes.iloc[-1]
+    slow_now = ema_slow.iloc[-1]
+    price = closes.iloc[-1]
 
     bullish = fast_now > slow_now and price > fast_now and fast_now > fast_prev
     bearish = fast_now < slow_now and price < fast_now and fast_now < fast_prev
@@ -291,60 +352,62 @@ def find_entry(df_m15, direction, atr_val):
         return None
 
     closes = df_m15["close"]
-    highs  = df_m15["high"]
-    lows   = df_m15["low"]
-    opens  = df_m15["open"]
+    highs = df_m15["high"]
+    lows = df_m15["low"]
+    opens = df_m15["open"]
 
     ema21 = ema(closes, settings["entry_ema"])
 
-    # Ultimele 3 candele
-    c0 = closes.iloc[-1]   # confirmare
-    c1 = closes.iloc[-2]   # pullback
+    c0 = closes.iloc[-1]
+    c1 = closes.iloc[-2]
     o0 = opens.iloc[-1]
     o1 = opens.iloc[-2]
     h0 = highs.iloc[-1]
     l0 = lows.iloc[-1]
     h1 = highs.iloc[-2]
     l1 = lows.iloc[-2]
-    e0 = ema21.iloc[-1]
     e1 = ema21.iloc[-2]
 
     sl_dist = atr_val * settings["atr_sl_mult"]
 
     if direction == "LONG":
-        # Pullback: candle bearish aproape de EMA21
         pb_touched = l1 <= e1 * 1.002
         pb_bearish = c1 < o1
-        # Confirmare: candle bullish care inchide peste high-ul anterior
         confirm = c0 > o0 and c0 > h1
-        # SL sub low-ul pullback-ului
         sl = min(l0, l1) - sl_dist * 0.3
         tp = c0 + (c0 - sl) * settings["rr_ratio"]
 
         if pb_touched and pb_bearish and confirm:
-            return {"direction": "LONG", "entry": c0, "sl": sl, "tp": tp,
-                    "reason": f"H1 trend LONG + M15 pullback EMA{settings['entry_ema']}"}
+            return {
+                "direction": "LONG",
+                "entry": c0,
+                "sl": sl,
+                "tp": tp,
+                "reason": f"H1 trend LONG + M15 pullback EMA{settings['entry_ema']}"
+            }
 
     if direction == "SHORT":
-        # Pullback: candle bullish aproape de EMA21
         pb_touched = h1 >= e1 * 0.998
         pb_bullish = c1 > o1
-        # Confirmare: candle bearish care inchide sub low-ul anterior
         confirm = c0 < o0 and c0 < l1
-        # SL peste high-ul pullback-ului
         sl = max(h0, h1) + sl_dist * 0.3
         tp = c0 - (sl - c0) * settings["rr_ratio"]
 
         if pb_touched and pb_bullish and confirm:
-            return {"direction": "SHORT", "entry": c0, "sl": sl, "tp": tp,
-                    "reason": f"H1 trend SHORT + M15 pullback EMA{settings['entry_ema']}"}
+            return {
+                "direction": "SHORT",
+                "entry": c0,
+                "sl": sl,
+                "tp": tp,
+                "reason": f"H1 trend SHORT + M15 pullback EMA{settings['entry_ema']}"
+            }
 
     return None
 
 
 def scan_pair(pair):
     """Scaneaza o pereche si returneaza semnal sau None."""
-    df_h1  = get_klines(pair, "1h", 250)
+    df_h1 = get_klines(pair, "1h", 250)
     df_m15 = get_klines(pair, "15m", 100)
 
     if df_h1.empty or df_m15.empty:
@@ -363,6 +426,7 @@ def scan_pair(pair):
 
     atr_val = atr(df_h1, settings["atr_period"]).iloc[-1]
     if pd.isna(atr_val) or atr_val <= 0:
+        add_log(f"[{pair}] ATR invalid.", "warn")
         return None
 
     signal = find_entry(df_m15, trend, atr_val)
@@ -373,12 +437,12 @@ def can_trade(pair):
     reset_daily_if_needed()
 
     with state_lock:
-        daily_dd     = state["daily_dd"]
+        daily_dd = state["daily_dd"]
         trades_today = state["trades_today"]
-        cons_losses  = state["consecutive_losses"]
-        open_all     = [p for p in state["positions"] if p["status"] == "open"]
-        open_pair    = [p for p in open_all if p["pair"] == pair]
-        last_ts      = state["last_trade_ts"].get(pair, 0)
+        cons_losses = state["consecutive_losses"]
+        open_all = [p for p in state["positions"] if p["status"] == "open"]
+        open_pair = [p for p in open_all if p["pair"] == pair]
+        last_ts = state["last_trade_ts"].get(pair, 0)
 
     if daily_dd >= settings["dd_limit"]:
         add_log(f"[{pair}] Daily DD {daily_dd:.2f}% atins.", "warn")
@@ -415,34 +479,34 @@ def open_trade(pair, signal):
     if not price:
         price = signal["entry"]
 
-    sl  = float(signal["sl"])
-    tp  = float(signal["tp"])
+    sl = float(signal["sl"])
+    tp = float(signal["tp"])
     direction = signal["direction"]
 
     with state_lock:
         capital = state["capital"] + state["pnl"]
 
     risk_usd = capital * (settings["risk_pct"] / 100)
-    sl_dist  = abs(price - sl)
+    sl_dist = abs(price - sl)
     if sl_dist <= 0:
+        add_log(f"[{pair}] SL distance invalida.", "warn")
         return
 
-    # Units = risc / distanta SL (in termeni de pret)
     units = round(risk_usd / sl_dist, 2)
 
     pos = {
-        "id":         f"{pair}_{int(time.time())}",
-        "pair":       pair,
-        "direction":  direction,
-        "entry":      price,
+        "id": f"{pair}_{int(time.time())}",
+        "pair": pair,
+        "direction": direction,
+        "entry": price,
         "mark_price": price,
-        "sl":         sl,
-        "tp":         tp,
-        "units":      units,
-        "status":     "open",
-        "open_time":  datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-        "reason":     signal["reason"],
-        "pnl_live":   0.0,
+        "sl": sl,
+        "tp": tp,
+        "units": units,
+        "status": "open",
+        "open_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        "reason": signal["reason"],
+        "pnl_live": 0.0,
     }
 
     with state_lock:
@@ -451,7 +515,7 @@ def open_trade(pair, signal):
         state["last_trade_ts"][pair] = time.time()
 
     add_log(
-        f"✅ [PAPER] {direction} {pair} @ {price:.5f} | SL:{sl:.5f} TP:{tp:.5f} | {signal['reason']}",
+        f"[PAPER] {direction} {pair} @ {price:.5f} | SL:{sl:.5f} TP:{tp:.5f} | {signal['reason']}",
         "ok"
     )
     save_state()
@@ -474,56 +538,60 @@ def update_positions():
 
         with state_lock:
             pos["mark_price"] = price
-            pos["pnl_live"]   = round(pnl_live, 2)
+            pos["pnl_live"] = round(pnl_live, 2)
 
-        hit_sl = (pos["direction"] == "LONG"  and price <= pos["sl"]) or \
-                 (pos["direction"] == "SHORT" and price >= pos["sl"])
-        hit_tp = (pos["direction"] == "LONG"  and price >= pos["tp"]) or \
-                 (pos["direction"] == "SHORT" and price <= pos["tp"])
+        hit_sl = (
+            (pos["direction"] == "LONG" and price <= pos["sl"]) or
+            (pos["direction"] == "SHORT" and price >= pos["sl"])
+        )
+        hit_tp = (
+            (pos["direction"] == "LONG" and price >= pos["tp"]) or
+            (pos["direction"] == "SHORT" and price <= pos["tp"])
+        )
 
         if hit_tp:
-            add_log(f"🎯 TP atins {pos['pair']} @ {price:.5f}", "ok")
+            add_log(f"TP atins {pos['pair']} @ {price:.5f}", "ok")
             close_trade(pos, price, pnl_live, "TP hit")
         elif hit_sl:
-            add_log(f"🛑 SL atins {pos['pair']} @ {price:.5f}", "warn")
+            add_log(f"SL atins {pos['pair']} @ {price:.5f}", "warn")
             close_trade(pos, price, pnl_live, "SL hit")
 
 
 def close_trade(pos, exit_price, pnl, reason):
     with state_lock:
-        pos["status"]     = "closed"
+        pos["status"] = "closed"
         pos["close_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-        pos["exit"]       = exit_price
-        pos["pnl_live"]   = round(pnl, 2)
-        state["pnl"]     += pnl
+        pos["exit"] = exit_price
+        pos["pnl_live"] = round(pnl, 2)
+        state["pnl"] += pnl
 
         if pnl > 0:
-            state["wins"]              += 1
+            state["wins"] += 1
             state["consecutive_losses"] = 0
         else:
-            state["losses"]             += 1
+            state["losses"] += 1
             state["consecutive_losses"] += 1
-            state["daily_dd"]           += abs(pnl) / max(state["capital"], 1) * 100
+            state["daily_dd"] += abs(pnl) / max(state["capital"], 1) * 100
 
     sl_dist = abs(pos["entry"] - pos["sl"])
-    rr_val  = abs((exit_price - pos["entry"]) / sl_dist) if sl_dist > 0 else 0
-    rr      = f"1:{rr_val:.1f}"
+    rr_val = abs((exit_price - pos["entry"]) / sl_dist) if sl_dist > 0 else 0
+    rr = f"1:{rr_val:.1f}"
 
     with state_lock:
         state["history"].append({
-            "date":   datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-            "pair":   pos["pair"],
-            "dir":    pos["direction"],
-            "entry":  pos["entry"],
-            "exit":   exit_price,
-            "pnl":    round(pnl, 2),
-            "rr":     rr,
+            "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            "pair": pos["pair"],
+            "dir": pos["direction"],
+            "entry": pos["entry"],
+            "exit": exit_price,
+            "pnl": round(pnl, 2),
+            "rr": rr,
             "reason": reason,
         })
         dd_hit = state["daily_dd"] >= settings["dd_limit"]
 
     add_log(
-        f"{'✅' if pnl > 0 else '❌'} {pos['pair']} {reason} | {pnl:+.2f} USD | {rr}",
+        f"{'WIN' if pnl > 0 else 'LOSS'} {pos['pair']} {reason} | {pnl:+.2f} USD | {rr}",
         "ok" if pnl > 0 else "err"
     )
     save_state()
@@ -531,11 +599,11 @@ def close_trade(pos, exit_price, pnl, reason):
     if dd_hit:
         with state_lock:
             state["running"] = False
-        add_log(f"⛔ Daily DD atins. Bot oprit!", "err")
+        add_log("Daily DD atins. Bot oprit.", "err")
 
 # ─── Bot Loop ─────────────────────────────────────────────────────────────────
 def bot_loop():
-    add_log("🟢 Forex Paper Bot pornit.", "ok")
+    add_log("Forex Paper Bot pornit.", "ok")
     time.sleep(2)
 
     while True:
@@ -549,26 +617,27 @@ def bot_loop():
 
             session = get_session()
             with state_lock:
-                state["session"]    = session
+                state["session"] = session
                 state["scan_count"] += 1
-                state["last_scan"]  = datetime.utcnow().strftime("%H:%M:%S")
+                state["last_scan"] = datetime.utcnow().strftime("%H:%M:%S")
 
-            # Actualizeaza pozitii deschise la fiecare scan
             update_positions()
 
             if not is_tradeable_session():
-                add_log(f"Sesiune {session} — nu trade-uim.", "info")
+                add_log(f"Sesiune {session} - nu trade-uim.", "info")
             else:
-                add_log(f"Sesiune: {session.upper()} — scan activ.", "info")
+                add_log(f"Sesiune: {session.upper()} - scan activ.", "info")
                 pairs = list(settings.get("pairs", []))
+
                 for pair in pairs:
                     with state_lock:
                         if not state["running"]:
                             break
+
                     if can_trade(pair):
                         signal = scan_pair(pair)
                         if signal:
-                            add_log(f"[{pair}] 📊 {signal['reason']}", "warn")
+                            add_log(f"[{pair}] Semnal: {signal['reason']}", "warn")
                             open_trade(pair, signal)
                         else:
                             add_log(f"[{pair}] Niciun setup.", "info")
@@ -583,7 +652,7 @@ def bot_loop():
                     break
             time.sleep(1)
 
-    add_log("⛔ Bot oprit.", "warn")
+    add_log("Bot oprit.", "warn")
 
 # ─── API ──────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -594,23 +663,22 @@ def index():
 @app.route("/api/status")
 def api_status():
     with state_lock:
-        total        = state["wins"] + state["losses"]
-        capital      = state["capital"]
-        pnl          = state["pnl"]
-        daily_dd     = state["daily_dd"]
-        wins         = state["wins"]
-        losses       = state["losses"]
-        scan_count   = state["scan_count"]
-        last_scan    = state["last_scan"]
-        regime       = dict(state["regime"])
+        total = state["wins"] + state["losses"]
+        capital = state["capital"]
+        pnl = state["pnl"]
+        daily_dd = state["daily_dd"]
+        wins = state["wins"]
+        losses = state["losses"]
+        scan_count = state["scan_count"]
+        last_scan = state["last_scan"]
+        regime = dict(state["regime"])
         trades_today = state["trades_today"]
-        cons_losses  = state["consecutive_losses"]
-        active       = len([p for p in state["positions"] if p["status"] == "open"])
-        running      = state["running"]
-        session      = state["session"]
-        live_pnl     = sum(p.get("pnl_live", 0) for p in state["positions"] if p["status"] == "open")
+        cons_losses = state["consecutive_losses"]
+        active = len([p for p in state["positions"] if p["status"] == "open"])
+        running = state["running"]
+        session = state["session"]
+        live_pnl = sum(p.get("pnl_live", 0) for p in state["positions"] if p["status"] == "open")
 
-    # Regim agregat
     if regime:
         vals = list(regime.values())
         regime_agg = "trending" if "trending" in vals else (vals[0] if vals else "unknown")
@@ -618,25 +686,25 @@ def api_status():
         regime_agg = "unknown"
 
     return jsonify({
-        "running":           running,
-        "paper":             True,
-        "capital":           round(capital, 2),
-        "pnl":               round(pnl, 2),
-        "live_pnl":          round(live_pnl, 2),
-        "pnl_pct":           round(pnl / max(capital, 1) * 100, 2),
-        "daily_dd":          round(daily_dd, 2),
-        "wins":              wins,
-        "losses":            losses,
-        "win_rate":          round(wins / total * 100, 1) if total > 0 else 0,
-        "active_positions":  active,
-        "scan_count":        scan_count,
-        "last_scan":         last_scan,
-        "regime":            regime_agg,
-        "regime_per_pair":   regime,
-        "trades_today":      trades_today,
+        "running": running,
+        "paper": True,
+        "capital": round(capital, 2),
+        "pnl": round(pnl, 2),
+        "live_pnl": round(live_pnl, 2),
+        "pnl_pct": round(pnl / max(capital, 1) * 100, 2),
+        "daily_dd": round(daily_dd, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
+        "active_positions": active,
+        "scan_count": scan_count,
+        "last_scan": last_scan,
+        "regime": regime_agg,
+        "regime_per_pair": regime,
+        "trades_today": trades_today,
         "consecutive_losses": cons_losses,
-        "session":           session,
-        "settings":          settings,
+        "session": session,
+        "settings": settings,
     })
 
 
@@ -716,10 +784,12 @@ def api_settings():
         if isinstance(v, list):
             settings["pairs"] = [str(s).strip().upper() for s in v if s]
 
-    for k in ["risk_pct", "dd_limit", "rr_ratio", "atr_sl_mult", "atr_period",
-              "trend_ema_fast", "trend_ema_slow", "entry_ema", "scan_interval",
-              "max_trades_day", "max_positions", "cooldown_minutes",
-              "pause_after_losses", "session_filter", "capital"]:
+    for k in [
+        "risk_pct", "dd_limit", "rr_ratio", "atr_sl_mult", "atr_period",
+        "trend_ema_fast", "trend_ema_slow", "entry_ema", "scan_interval",
+        "max_trades_day", "max_positions", "cooldown_minutes",
+        "pause_after_losses", "session_filter", "capital"
+    ]:
         if k in data:
             settings[k] = data[k]
 
