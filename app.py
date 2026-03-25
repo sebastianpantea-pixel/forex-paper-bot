@@ -154,7 +154,6 @@ def reset_daily_if_needed():
 
 
 def get_session():
-    """Detecteaza sesiunea forex curenta in UTC."""
     now_utc = datetime.utcnow()
     h = now_utc.hour
 
@@ -214,10 +213,8 @@ def clean_ohlcv(df):
     df = df.dropna(subset=["open", "high", "low", "close"])
     return df
 
-
 # ─── Date de piata ─────────────────────────────────────────────────────────────
 def get_price(pair):
-    """Pret curent estimat din ultima lumânare 1m."""
     ticker = PAIRS_MAP.get(pair)
     if not ticker:
         return None
@@ -246,48 +243,44 @@ def get_price(pair):
 
 
 def get_klines(pair, interval="1h", limit=250):
-    """
-    Descarca date OHLCV.
-    interval intern: '15m', '1h', '1d'
-    """
     ticker = PAIRS_MAP.get(pair)
     if not ticker:
         return pd.DataFrame()
 
-    try:
-        yf_interval = normalize_interval(interval)
-        period = get_period_for_interval(interval)
+    yf_interval = normalize_interval(interval)
+    period = get_period_for_interval(interval)
+    last_err = None
 
-        df = yf.download(
-            ticker,
-            interval=yf_interval,
-            period=period,
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-            prepost=False,
-        )
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                ticker,
+                interval=yf_interval,
+                period=period,
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                prepost=False,
+            )
 
-        if df is None or df.empty:
-            add_log(f"[{pair}] yfinance DataFrame gol {interval} ({ticker}).", "warn")
-            return pd.DataFrame()
+            if df is not None and not df.empty:
+                df = clean_ohlcv(df)
+                if not df.empty and len(df) >= 30:
+                    add_log(f"[{pair}] {interval} ok | rows={len(df)} | try={attempt + 1}", "info")
+                    return df.tail(limit)
 
-        df = clean_ohlcv(df)
-        if df.empty:
-            add_log(f"[{pair}] OHLC invalid {interval} ({ticker}).", "err")
-            return pd.DataFrame()
+            add_log(f"[{pair}] yfinance DataFrame gol {interval} ({ticker}) | try={attempt + 1}", "warn")
+            time.sleep(1.5 * (attempt + 1))
 
-        add_log(f"[{pair}] {interval} ok | rows={len(df)} | ticker={ticker}", "info")
+        except Exception as e:
+            last_err = e
+            add_log(f"[{pair}] retry error {interval} ({ticker}) | try={attempt + 1}: {e}", "warn")
+            time.sleep(1.5 * (attempt + 1))
 
-        if len(df) < 30:
-            add_log(f"[{pair}] Prea putine lumanari pe {interval}: {len(df)}", "warn")
-            return pd.DataFrame()
+    if last_err:
+        add_log(f"[{pair}] Klines failed {interval} ({ticker}): {last_err}", "err")
 
-        return df.tail(limit)
-
-    except Exception as e:
-        add_log(f"[{pair}] Klines error {interval} ({ticker}): {e}", "err")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 # ─── Indicatori ───────────────────────────────────────────────────────────────
 def ema(series, period):
@@ -303,7 +296,6 @@ def atr(df, period=14):
 
 
 def detect_regime(df_h1):
-    """Trending / ranging bazat pe ATR relativ."""
     if df_h1.empty or len(df_h1) < 20:
         return "unknown"
     a = atr(df_h1, 14).iloc[-1]
@@ -317,10 +309,6 @@ def detect_regime(df_h1):
 
 # ─── Strategie ────────────────────────────────────────────────────────────────
 def detect_trend(df_h1):
-    """
-    Trend pe H1: EMA50 vs EMA200.
-    Returneaza 'LONG', 'SHORT' sau None.
-    """
     if df_h1.empty or len(df_h1) < settings["trend_ema_slow"] + 5:
         return None
 
@@ -344,10 +332,6 @@ def detect_trend(df_h1):
 
 
 def find_entry(df_m15, direction, atr_val):
-    """
-    Entry pe M15: pullback la EMA21, confirmare candle.
-    Returneaza dict cu entry/sl/tp sau None.
-    """
     if df_m15.empty or len(df_m15) < 30:
         return None
 
@@ -406,7 +390,6 @@ def find_entry(df_m15, direction, atr_val):
 
 
 def scan_pair(pair):
-    """Scaneaza o pereche si returneaza semnal sau None."""
     df_h1 = get_klines(pair, "1h", 250)
     df_m15 = get_klines(pair, "15m", 100)
 
@@ -522,7 +505,6 @@ def open_trade(pair, signal):
 
 
 def update_positions():
-    """Actualizeaza P&L live si verifica SL/TP."""
     with state_lock:
         open_positions = [p for p in state["positions"] if p["status"] == "open"]
 
@@ -724,6 +706,43 @@ def api_history():
 def api_log():
     with state_lock:
         return jsonify(state["log"][:100])
+
+
+@app.route("/api/test-yf")
+def api_test_yf():
+    out = {}
+    tests = [
+        ("EURUSD=X", "15m", "7d"),
+        ("AUDUSD=X", "15m", "7d"),
+        ("USDCHF=X", "15m", "7d"),
+        ("GC=F", "15m", "7d"),
+        ("EURUSD=X", "60m", "60d"),
+        ("AUDUSD=X", "60m", "60d"),
+        ("USDCHF=X", "60m", "60d"),
+        ("GC=F", "60m", "60d"),
+    ]
+
+    for ticker, interval, period in tests:
+        try:
+            df = yf.download(
+                ticker,
+                interval=interval,
+                period=period,
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                prepost=False,
+            )
+
+            out[f"{ticker}_{interval}"] = {
+                "empty": bool(df is None or df.empty),
+                "rows": 0 if df is None else len(df),
+                "cols": [] if df is None else [str(c) for c in df.columns],
+            }
+        except Exception as e:
+            out[f"{ticker}_{interval}"] = {"error": str(e)}
+
+    return jsonify(out)
 
 
 @app.route("/api/start", methods=["POST"])
