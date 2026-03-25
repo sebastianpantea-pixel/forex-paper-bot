@@ -1,6 +1,6 @@
 """
 Forex Intraday Bot — Flask Server
-Paper Trading cu date reale de la Yahoo Finance
+Paper Trading cu date reale de la Twelve Data
 
 Perechi: EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, XAU/USD
 Strategie: Triple EMA Trend Filter + ATR Stop + Session Filter
@@ -19,23 +19,26 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-import yfinance as yf
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from twelvedata import TDClient
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 PAIRS_MAP = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    "USDCHF": "USDCHF=X",
-    "AUDUSD": "AUDUSD=X",
-    "XAUUSD": "GC=F",
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "USDCHF": "USD/CHF",
+    "AUDUSD": "AUD/USD",
+    "XAUUSD": "XAU/USD",
 }
+
+TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "").strip()
+td = TDClient(apikey=TWELVE_API_KEY) if TWELVE_API_KEY else None
 
 # ─── State ────────────────────────────────────────────────────────────────────
 state = {
@@ -174,33 +177,22 @@ def is_tradeable_session():
     session = get_session()
     return session in ("london", "newyork", "overlap")
 
-# ─── Yahoo helpers ────────────────────────────────────────────────────────────
+
 def normalize_interval(interval):
     return {
-        "15m": "15m",
-        "1h": "60m",
-        "1d": "1d",
-        "1m": "1m",
+        "1m": "1min",
+        "15m": "15min",
+        "1h": "1h",
+        "1d": "1day",
     }.get(interval, interval)
-
-
-def get_period_for_interval(interval):
-    return {
-        "1m": "1d",
-        "15m": "7d",
-        "1h": "60d",
-        "1d": "365d",
-    }.get(interval, "60d")
 
 
 def clean_ohlcv(df):
     if df is None or df.empty:
         return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[0]).lower() for c in df.columns]
-    else:
-        df.columns = [str(c).lower() for c in df.columns]
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
     for col in ["open", "high", "low", "close"]:
         if col not in df.columns:
@@ -209,76 +201,82 @@ def clean_ohlcv(df):
     if "volume" not in df.columns:
         df["volume"] = 0
 
-    df = df[["open", "high", "low", "close", "volume"]].copy()
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+        df = df.dropna(subset=["datetime"])
+        df = df.sort_values("datetime").set_index("datetime")
+    else:
+        try:
+            df.index = pd.to_datetime(df.index, errors="coerce", utc=True)
+            df = df[~df.index.isna()]
+            df = df.sort_index()
+        except Exception:
+            pass
+
     df = df.dropna(subset=["open", "high", "low", "close"])
-    return df
+    return df[["open", "high", "low", "close", "volume"]].copy()
+
+
+def fetch_td_series(symbol, interval, outputsize):
+    if not td:
+        raise RuntimeError("Lipseste TWELVE_API_KEY")
+
+    ts = td.time_series(
+        symbol=symbol,
+        interval=interval,
+        outputsize=outputsize,
+        timezone="UTC",
+    )
+    df = ts.as_pandas()
+    return clean_ohlcv(df)
 
 # ─── Date de piata ─────────────────────────────────────────────────────────────
 def get_price(pair):
-    ticker = PAIRS_MAP.get(pair)
-    if not ticker:
+    symbol = PAIRS_MAP.get(pair)
+    if not symbol:
         return None
 
     try:
-        df = yf.download(
-            ticker,
-            interval="1m",
-            period="1d",
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-            prepost=False,
-        )
-
-        df = clean_ohlcv(df)
+        # luam ultima lumânare 1min ca pret curent aproximativ
+        df = fetch_td_series(symbol, "1min", 2)
         if df.empty:
-            add_log(f"[{pair}] Price data goala ({ticker}).", "warn")
+            add_log(f"[{pair}] Price data goala ({symbol}).", "warn")
             return None
-
         return float(df["close"].iloc[-1])
-
     except Exception as e:
-        add_log(f"[{pair}] Price error ({ticker}): {e}", "err")
+        add_log(f"[{pair}] Price error ({symbol}): {e}", "err")
         return None
 
 
 def get_klines(pair, interval="1h", limit=250):
-    ticker = PAIRS_MAP.get(pair)
-    if not ticker:
+    symbol = PAIRS_MAP.get(pair)
+    if not symbol:
         return pd.DataFrame()
 
-    yf_interval = normalize_interval(interval)
-    period = get_period_for_interval(interval)
+    td_interval = normalize_interval(interval)
     last_err = None
 
     for attempt in range(3):
         try:
-            df = yf.download(
-                ticker,
-                interval=yf_interval,
-                period=period,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                prepost=False,
-            )
+            df = fetch_td_series(symbol, td_interval, limit)
+            if not df.empty and len(df) >= 30:
+                add_log(f"[{pair}] {interval} ok | rows={len(df)} | try={attempt + 1}", "info")
+                return df.tail(limit)
 
-            if df is not None and not df.empty:
-                df = clean_ohlcv(df)
-                if not df.empty and len(df) >= 30:
-                    add_log(f"[{pair}] {interval} ok | rows={len(df)} | try={attempt + 1}", "info")
-                    return df.tail(limit)
-
-            add_log(f"[{pair}] yfinance DataFrame gol {interval} ({ticker}) | try={attempt + 1}", "warn")
+            add_log(f"[{pair}] DataFrame gol {interval} ({symbol}) | try={attempt + 1}", "warn")
             time.sleep(1.5 * (attempt + 1))
 
         except Exception as e:
             last_err = e
-            add_log(f"[{pair}] retry error {interval} ({ticker}) | try={attempt + 1}: {e}", "warn")
+            add_log(f"[{pair}] Klines error {interval} ({symbol}) | try={attempt + 1}: {e}", "warn")
             time.sleep(1.5 * (attempt + 1))
 
     if last_err:
-        add_log(f"[{pair}] Klines failed {interval} ({ticker}): {last_err}", "err")
+        add_log(f"[{pair}] Klines failed {interval} ({symbol}): {last_err}", "err")
 
     return pd.DataFrame()
 
@@ -402,7 +400,7 @@ def scan_pair(pair):
         state["regime"][pair] = regime
 
     trend = detect_trend(df_h1)
-    add_log(f"[{pair}] Trend:{trend or '—'} | Regim:{regime}")
+    add_log(f"[{pair}] Trend:{trend or '-'} | Regim:{regime}")
 
     if trend is None:
         return None
@@ -597,6 +595,12 @@ def bot_loop():
         try:
             reset_daily_if_needed()
 
+            if not td:
+                add_log("TWELVE_API_KEY lipseste. Bot oprit.", "err")
+                with state_lock:
+                    state["running"] = False
+                break
+
             session = get_session()
             with state_lock:
                 state["session"] = session
@@ -708,39 +712,30 @@ def api_log():
         return jsonify(state["log"][:100])
 
 
-@app.route("/api/test-yf")
-def api_test_yf():
+@app.route("/api/test-td")
+def api_test_td():
     out = {}
     tests = [
-        ("EURUSD=X", "15m", "7d"),
-        ("AUDUSD=X", "15m", "7d"),
-        ("USDCHF=X", "15m", "7d"),
-        ("GC=F", "15m", "7d"),
-        ("EURUSD=X", "60m", "60d"),
-        ("AUDUSD=X", "60m", "60d"),
-        ("USDCHF=X", "60m", "60d"),
-        ("GC=F", "60m", "60d"),
+        ("EUR/USD", "15min", 20),
+        ("AUD/USD", "15min", 20),
+        ("USD/CHF", "15min", 20),
+        ("XAU/USD", "15min", 20),
+        ("EUR/USD", "1h", 20),
+        ("AUD/USD", "1h", 20),
+        ("USD/CHF", "1h", 20),
+        ("XAU/USD", "1h", 20),
     ]
 
-    for ticker, interval, period in tests:
+    for symbol, interval, outputsize in tests:
         try:
-            df = yf.download(
-                ticker,
-                interval=interval,
-                period=period,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                prepost=False,
-            )
-
-            out[f"{ticker}_{interval}"] = {
+            df = fetch_td_series(symbol, interval, outputsize)
+            out[f"{symbol}_{interval}"] = {
                 "empty": bool(df is None or df.empty),
                 "rows": 0 if df is None else len(df),
                 "cols": [] if df is None else [str(c) for c in df.columns],
             }
         except Exception as e:
-            out[f"{ticker}_{interval}"] = {"error": str(e)}
+            out[f"{symbol}_{interval}"] = {"error": str(e)}
 
     return jsonify(out)
 
