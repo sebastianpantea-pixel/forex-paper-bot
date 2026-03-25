@@ -684,7 +684,7 @@ def api_status():
         active = len([p for p in state["positions"] if p["status"] == "open"])
         running = state["running"]
         session = state["session"]
-        live_pnl = sum(p.get("pnl_live", 0) for p in state["positions"] if p["status"] == "open"])
+        live_pnl = sum(p.get("pnl_live", 0) for p in state["positions"] if p["status"] == "open")
 
     if regime:
         vals = list(regime.values())
