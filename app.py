@@ -1,7 +1,7 @@
 """
 Forex Intraday Bot — Flask Server
 Paper Trading cu date reale de la Twelve Data
-Optimizat pentru plan cu limita mica de requesturi
+Optimizat pentru plan Free
 
 Strategie:
 - Trend pe H1: EMA50 vs EMA200
@@ -9,12 +9,12 @@ Strategie:
 - ATR-based SL/TP
 - Session filter: London + NY only
 
-Optimizari pentru API:
-- doar 2 perechi implicite
-- scanare la 15 minute
-- fara retry agresiv
-- fara request separat de pret pentru fiecare pozitie
-- foloseste ultimul close din M15 pentru mark price si semnal
+Optimizari:
+- 3 perechi implicite
+- scanare la 5 minute
+- 1 retry mic doar la erori tranzitorii de conexiune
+- pauza intre perechi
+- fara request separat de pret, foloseste ultimul close din M15
 """
 
 import os
@@ -69,7 +69,7 @@ state = {
 }
 
 settings = {
-    "pairs": ["EURUSD", "USDCHF"],
+    "pairs": ["EURUSD", "USDCHF", "GBPUSD"],
     "capital": 10000.0,
     "risk_pct": 0.5,
     "dd_limit": 3.0,
@@ -79,9 +79,9 @@ settings = {
     "trend_ema_fast": 50,
     "trend_ema_slow": 200,
     "entry_ema": 21,
-    "scan_interval": 900,
+    "scan_interval": 300,
     "max_trades_day": 4,
-    "max_positions": 2,
+    "max_positions": 3,
     "cooldown_minutes": 60,
     "pause_after_losses": 3,
     "session_filter": True,
@@ -231,14 +231,36 @@ def fetch_td_series(symbol, interval, outputsize):
     if not td:
         raise RuntimeError("Lipseste TWELVE_API_KEY")
 
-    ts = td.time_series(
-        symbol=symbol,
-        interval=interval,
-        outputsize=outputsize,
-        timezone="UTC",
-    )
-    df = ts.as_pandas()
-    return clean_ohlcv(df)
+    last_err = None
+
+    for attempt in range(2):
+        try:
+            ts = td.time_series(
+                symbol=symbol,
+                interval=interval,
+                outputsize=outputsize,
+                timezone="UTC",
+            )
+            df = ts.as_pandas()
+            return clean_ohlcv(df)
+
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+
+            transient = (
+                "connection reset by peer" in msg or
+                "connection aborted" in msg or
+                "remote end closed connection" in msg or
+                "timed out" in msg or
+                "timeout" in msg
+            )
+
+            if attempt == 0 and transient:
+                time.sleep(2)
+                continue
+
+            raise last_err
 
 # ─── Date de piata ─────────────────────────────────────────────────────────────
 def get_klines(pair, interval="1h", limit=250):
@@ -621,15 +643,16 @@ def bot_loop():
                         else:
                             add_log(f"[{pair}] Niciun setup.", "info")
                     else:
-                        # chiar daca nu putem deschide trade, putem actualiza pretul pentru pozitii deja existente
                         scan_pair(pair)
+
+                    time.sleep(1)
 
                 update_positions()
 
         except Exception as e:
             add_log(f"Eroare bot_loop: {e}", "err")
 
-        interval = int(settings.get("scan_interval", 900))
+        interval = int(settings.get("scan_interval", 300))
         for _ in range(interval):
             with state_lock:
                 if not state["running"]:
@@ -661,7 +684,7 @@ def api_status():
         active = len([p for p in state["positions"] if p["status"] == "open"])
         running = state["running"]
         session = state["session"]
-        live_pnl = sum(p.get("pnl_live", 0) for p in state["positions"] if p["status"] == "open")
+        live_pnl = sum(p.get("pnl_live", 0) for p in state["positions"] if p["status"] == "open"])
 
     if regime:
         vals = list(regime.values())
@@ -716,8 +739,10 @@ def api_test_td():
     tests = [
         ("EUR/USD", "15min", 20),
         ("USD/CHF", "15min", 20),
+        ("GBP/USD", "15min", 20),
         ("EUR/USD", "1h", 20),
         ("USD/CHF", "1h", 20),
+        ("GBP/USD", "1h", 20),
     ]
 
     for symbol, interval, outputsize in tests:
